@@ -4,6 +4,14 @@ const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
 
+// Use bundled, statically-linked ffmpeg/ffprobe binaries instead of whatever the OS
+// happens to have installed. This avoids depending on the host's apt packages and
+// their shared-library dependencies (e.g. libvpx, libx264) being fully present —
+// a static binary has everything compiled in, so there's nothing for the dynamic
+// linker to fail to find at runtime.
+ffmpeg.setFfmpegPath(require('ffmpeg-static'));
+ffmpeg.setFfprobePath(require('ffprobe-static').path);
+
 /**
  * Probe a file on disk with ffprobe: confirms it actually contains a decodable
  * video stream (not just a spoofed Content-Type/extension) and returns its duration.
