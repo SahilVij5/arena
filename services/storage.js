@@ -1,4 +1,4 @@
-const { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand, PutBucketCorsCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const crypto = require('crypto');
@@ -25,6 +25,26 @@ if (SPACES_ENDPOINT && SPACES_ACCESS_KEY && SPACES_SECRET_KEY) {
     },
   });
   console.log('  DigitalOcean Spaces initialized');
+
+  // Configure CORS on the bucket so browsers can PUT files directly
+  // (required for presigned URL uploads — without this the browser's
+  // preflight OPTIONS request is rejected and the XHR fails with a network error)
+  s3Client.send(new PutBucketCorsCommand({
+    Bucket: SPACES_BUCKET,
+    CORSConfiguration: {
+      CORSRules: [{
+        AllowedHeaders: ['*'],
+        AllowedMethods: ['GET', 'PUT', 'POST', 'DELETE', 'HEAD'],
+        AllowedOrigins: ['*'],
+        ExposeHeaders: ['ETag'],
+        MaxAgeSeconds: 3600,
+      }],
+    },
+  })).then(() => {
+    console.log('  Spaces CORS configured for direct browser uploads');
+  }).catch((err) => {
+    console.warn('  Could not set Spaces CORS (uploads may fail from browser):', err.message);
+  });
 }
 
 function isStorageReady() {
