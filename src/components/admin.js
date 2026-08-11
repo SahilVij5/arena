@@ -575,7 +575,6 @@
           const xhr = new XMLHttpRequest();
           xhr.open('PUT', uploadUrl);
           xhr.setRequestHeader('Content-Type', selectedFile.type);
-          xhr.setRequestHeader('x-amz-acl', 'public-read');
 
           xhr.upload.addEventListener('progress', (e) => {
             if (e.lengthComputable) {
