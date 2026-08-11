@@ -20,13 +20,24 @@ ffmpeg.setFfprobePath(require('ffprobe-static').path);
  */
 async function probeVideoFile(videoFilePath) {
   return new Promise((resolve) => {
+    console.log(`Starting ffprobe for file: ${videoFilePath}`);
     ffmpeg.ffprobe(videoFilePath, (err, metadata) => {
       if (err) {
         console.error('ffprobe validation error:', err.message);
         return resolve({ isValidVideo: false, durationSeconds: null });
       }
+      
+      console.log('ffprobe metadata received:', JSON.stringify({
+        format: metadata.format,
+        streamsCount: metadata.streams ? metadata.streams.length : 0,
+        streamTypes: metadata.streams ? metadata.streams.map(s => s.codec_type) : []
+      }));
+      
       const hasVideoStream = Array.isArray(metadata.streams) &&
         metadata.streams.some((s) => s.codec_type === 'video');
+        
+      console.log(`hasVideoStream: ${hasVideoStream}`);
+        
       resolve({
         isValidVideo: hasVideoStream,
         durationSeconds: Math.round(metadata.format?.duration || 0),
