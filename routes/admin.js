@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { isStorageReady, generateUploadKey, uploadFile, uploadFileStream, downloadFile, downloadPartial, downloadToTempFile, deleteFile, getPublicUrl } = require('../services/storage');
+const { isStorageReady, generateUploadKey, generatePresignedUploadUrl, uploadFile, uploadFileStream, downloadFile, downloadPartial, downloadToTempFile, deleteFile, getPublicUrl } = require('../services/storage');
 const { generateThumbnailFromPath, probeVideoFile } = require('../services/thumbnail');
 
 const router = express.Router();
@@ -307,58 +307,88 @@ router.get('/videos', adminAuth, async (req, res) => {
   }
 });
 
-// UPLOAD video
-router.post('/videos/upload', adminAuth, upload.fields([{ name: 'video', maxCount: 1 }, { name: 'thumbnail', maxCount: 1 }]), async (req, res) => {
-  const videoFile = req.files && req.files['video'] && req.files['video'][0];
-  const thumbnailFile = req.files && req.files['thumbnail'] && req.files['thumbnail'][0];
+// ── STEP 1: Prepare Upload ──
+// Returns a presigned PUT URL pointing directly at Spaces.
+// The browser will upload the raw video bytes to that URL — the Node.js server
+// is never in the data path, so DigitalOcean's 512 MB request limit is bypassed.
+router.post('/videos/prepare-upload', adminAuth, async (req, res) => {
+  try {
+    if (!isStorageReady()) return res.status(503).json({ ok: false, error: 'Storage not configured' });
+
+    const { filename, contentType, fileSize } = req.body;
+
+    if (!filename || !contentType) {
+      return res.status(400).json({ ok: false, error: 'filename and contentType are required' });
+    }
+    if (!contentType.startsWith('video/')) {
+      return res.status(400).json({ ok: false, error: 'Only video files are allowed' });
+    }
+
+    const videoKey = generateUploadKey('videos', filename);
+    const uploadUrl = await generatePresignedUploadUrl(videoKey, contentType, 3600);
+
+    console.log(`Presigned upload URL generated for key: ${videoKey} (${Math.round((fileSize || 0) / 1024 / 1024)} MB)`);
+
+    return res.json({ ok: true, uploadUrl, videoKey });
+  } catch (err) {
+    console.error('Prepare upload error:', err);
+    return res.status(500).json({ ok: false, error: 'Could not generate upload URL' });
+  }
+});
+
+// ── STEP 2: Finalize Upload ──
+// Called after the browser has finished uploading directly to Spaces.
+// Downloads the file, validates it with ffprobe, generates a thumbnail, saves to DB.
+router.post('/videos/finalize-upload', adminAuth, async (req, res) => {
+  let tmpVideoPath = null;
 
   try {
     if (!isDBReady()) return res.status(503).json({ ok: false, error: 'Database not available' });
     if (!isStorageReady()) return res.status(503).json({ ok: false, error: 'Storage not configured' });
-    if (!videoFile) return res.status(400).json({ ok: false, error: 'No video file uploaded' });
 
-    const { title, tag, category_id, price } = req.body;
-    if (!title || !title.trim()) {
-      return res.status(400).json({ ok: false, error: 'Video title is required' });
-    }
-    if (!category_id) {
-      return res.status(400).json({ ok: false, error: 'Category is required' });
-    }
+    const { videoKey, title, category_id, price, tag, thumbnailDataUrl, filename, contentType, fileSize } = req.body;
 
-    // Price in paise (e.g. 4900 = ₹49). Default to 0 (free) if not provided.
+    if (!videoKey) return res.status(400).json({ ok: false, error: 'videoKey is required' });
+    if (!title || !title.trim()) return res.status(400).json({ ok: false, error: 'Video title is required' });
+    if (!category_id) return res.status(400).json({ ok: false, error: 'Category is required' });
+
     const priceInPaise = price ? parseInt(price) : 0;
+    const mimeType = contentType || 'video/mp4';
+    const originalName = filename || 'video.mp4';
 
-    const originalName = videoFile.originalname;
-    const mimeType = videoFile.mimetype;
-    const fileSize = videoFile.size;
+    // Download video from Spaces to a temp file for ffprobe + thumbnail
+    console.log(`Finalizing upload: downloading ${videoKey} from Spaces for validation...`);
+    tmpVideoPath = await downloadToTempFile(videoKey);
 
-    // Confirm the file is actually a decodable video (checks the real bytes via ffprobe)
-    // rather than trusting the client-supplied Content-Type, which is easy to fake.
-    const probe = await probeVideoFile(videoFile.path);
+    // Validate the file is actually a decodable video
+    const probe = await probeVideoFile(tmpVideoPath);
     if (!probe.isValidVideo) {
+      // Delete the invalid file from Spaces to avoid orphaned storage
+      console.warn(`Uploaded file ${videoKey} failed ffprobe validation — deleting from Spaces`);
+      try { await deleteFile(videoKey); } catch (e) { /* ignore */ }
       return res.status(400).json({ ok: false, error: 'Uploaded file is not a valid video' });
     }
     const durationSeconds = probe.durationSeconds;
+    console.log(`Validation passed. Duration: ${durationSeconds}s`);
 
-    // 1. Stream video to storage — reads off disk in chunks, never holds the whole file in RAM
-    const videoKey = generateUploadKey('videos', originalName);
-    const videoUrl = await uploadFileStream(videoFile.path, videoKey, mimeType);
-
-    // 2. Generate thumbnail — prefer client-sent, then ffmpeg, then placeholder
+    // Generate / upload thumbnail
     let thumbnailUrl = null;
     let thumbnailKey = null;
 
-    if (thumbnailFile) {
-      // Client generated thumbnail (small image — fine to read fully into memory)
+    if (thumbnailDataUrl && thumbnailDataUrl.startsWith('data:image/')) {
+      // Client sent a base64 thumbnail captured from the video element
+      const base64Data = thumbnailDataUrl.replace(/^data:image\/\w+;base64,/, '');
+      const thumbBuffer = Buffer.from(base64Data, 'base64');
       thumbnailKey = generateUploadKey('thumbnails', originalName.replace(/\.[^.]+$/, '.jpg'));
-      thumbnailUrl = await uploadFile(fs.readFileSync(thumbnailFile.path), thumbnailKey, 'image/jpeg');
+      thumbnailUrl = await uploadFile(thumbBuffer, thumbnailKey, 'image/jpeg');
     } else {
-      const thumbBuffer = await generateThumbnailFromPath(videoFile.path);
+      // Generate thumbnail with ffmpeg from the temp file
+      const thumbBuffer = await generateThumbnailFromPath(tmpVideoPath);
       if (thumbBuffer) {
         thumbnailKey = generateUploadKey('thumbnails', originalName.replace(/\.[^.]+$/, '.jpg'));
         thumbnailUrl = await uploadFile(thumbBuffer, thumbnailKey, 'image/jpeg');
       } else {
-        // Generate a simple SVG placeholder thumbnail and upload it
+        // SVG placeholder fallback
         const placeholderSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
           <rect width="1280" height="720" fill="#1f2326"/>
           <polygon points="600,300 600,420 700,360" fill="#85c742" opacity="0.8"/>
@@ -370,7 +400,7 @@ router.post('/videos/upload', adminAuth, upload.fields([{ name: 'video', maxCoun
       }
     }
 
-    // 3. Format duration string
+    // Format duration
     let durationStr = '0:00';
     if (durationSeconds) {
       const mins = Math.floor(durationSeconds / 60);
@@ -378,21 +408,24 @@ router.post('/videos/upload', adminAuth, upload.fields([{ name: 'video', maxCoun
       durationStr = `${mins}:${secs.toString().padStart(2, '0')}`;
     }
 
-    // 4. Insert into database
+    const videoUrl = getPublicUrl(videoKey);
+    const fileSizeBytes = fileSize ? parseInt(fileSize) : 0;
+
+    // Insert into database
     const result = await pool.query(
       `INSERT INTO videos (title, category, sport, price, thumbnail_url, video_url, duration, channel_name, channel_avatar, views, likes, tag, is_live, is_premium, category_id, file_key, thumbnail_key, file_size, mime_type, duration_seconds, upload_status, source_type)
        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, 'completed', 'storage')
        RETURNING *`,
       [
         title.trim(),
-        '', // category text (legacy, using category_id now)
-        '', // sport (legacy)
+        '',
+        '',
         priceInPaise,
         thumbnailUrl || '',
         videoUrl,
         durationStr,
-        '', // channel_name (not used for R2 uploads)
-        '', // channel_avatar (not used for R2 uploads)
+        '',
+        '',
         '0',
         '0',
         tag || null,
@@ -401,32 +434,24 @@ router.post('/videos/upload', adminAuth, upload.fields([{ name: 'video', maxCoun
         parseInt(category_id),
         videoKey,
         thumbnailKey,
-        fileSize,
+        fileSizeBytes,
         mimeType,
         durationSeconds,
       ]
     );
 
+    console.log(`Video finalized and saved to DB: id=${result.rows[0].id}`);
     return res.json({ ok: true, video: result.rows[0] });
+
   } catch (err) {
-    console.error('Admin video upload error:', err);
-    return res.status(500).json({ ok: false, error: err.message || 'Could not upload video' });
+    console.error('Finalize upload error:', err);
+    return res.status(500).json({ ok: false, error: err.message || 'Could not finalize upload' });
   } finally {
-    // Always clean up the temp files — success, validation failure, or thrown error.
-    cleanupUploadedFiles(req.files);
+    // Always clean up the temp file
+    if (tmpVideoPath) try { fs.unlinkSync(tmpVideoPath); } catch (e) { /* ignore */ }
   }
 });
 
-// Catches multer errors (oversized file, wrong field type) so they come back as JSON
-// instead of Express's default HTML error page, and cleans up any temp files multer
-// had already written for this request before the error happened.
-router.use('/videos/upload', (err, req, res, next) => {
-  cleanupUploadedFiles(req.files);
-  if (err instanceof multer.MulterError && err.code === 'LIMIT_FILE_SIZE') {
-    return res.status(400).json({ ok: false, error: 'File is too large' });
-  }
-  return res.status(400).json({ ok: false, error: err.message || 'Upload failed' });
-});
 
 // UPDATE video metadata
 router.put('/videos/:id', adminAuth, async (req, res) => {

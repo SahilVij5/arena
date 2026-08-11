@@ -540,63 +540,108 @@
       submitBtn.textContent = 'Uploading...';
 
       const progressSection = overlay.querySelector('#upload-progress-section');
+      const progressBar = overlay.querySelector('#upload-progress-bar');
+      const statusText = overlay.querySelector('#upload-status');
       progressSection.style.display = 'block';
 
-      const formData = new FormData();
-      formData.append('video', selectedFile);
-      if (generatedThumbnail) formData.append('thumbnail', generatedThumbnail, 'thumbnail.jpg');
-      formData.append('title', title);
-      formData.append('category_id', categoryId);
-      formData.append('price', parseInt(priceRupees) * 100); // Convert rupees to paise
-      if (tag) formData.append('tag', tag);
-
       try {
-        const xhr = new XMLHttpRequest();
-
-        xhr.upload.addEventListener('progress', (e) => {
-          if (e.lengthComputable) {
-            const pct = Math.round((e.loaded / e.total) * 100);
-            overlay.querySelector('#upload-progress-bar').style.width = pct + '%';
-            overlay.querySelector('#upload-status').textContent = pct < 100 ? `Uploading... ${pct}%` : 'Processing video...';
-          }
+        // ── Step 1: Get presigned URL from server ──
+        statusText.textContent = 'Preparing upload...';
+        const prepareRes = await fetch('/api/admin/videos/prepare-upload', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            filename: selectedFile.name,
+            contentType: selectedFile.type,
+            fileSize: selectedFile.size,
+          }),
         });
-
-        xhr.addEventListener('load', () => {
-          try {
-            const data = JSON.parse(xhr.responseText);
-            if (data.ok) {
-              overlay.remove();
-              loadVideos();
-            } else {
-              alert(data.error || 'Upload failed');
-              submitBtn.disabled = false;
-              submitBtn.textContent = 'Upload Video';
-              progressSection.style.display = 'none';
-            }
-          } catch {
-            alert('Upload failed — invalid response');
-            submitBtn.disabled = false;
-            submitBtn.textContent = 'Upload Video';
-          }
-        });
-
-        xhr.addEventListener('error', () => {
-          alert('Upload failed — network error');
+        const prepareData = await prepareRes.json();
+        if (!prepareData.ok) {
+          alert(prepareData.error || 'Could not prepare upload');
           submitBtn.disabled = false;
           submitBtn.textContent = 'Upload Video';
           progressSection.style.display = 'none';
+          return;
+        }
+        const { uploadUrl, videoKey } = prepareData;
+
+        // ── Step 2: Upload file directly to Spaces ──
+        statusText.textContent = 'Uploading... 0%';
+        await new Promise((resolve, reject) => {
+          const xhr = new XMLHttpRequest();
+          xhr.open('PUT', uploadUrl);
+          xhr.setRequestHeader('Content-Type', selectedFile.type);
+          xhr.setRequestHeader('x-amz-acl', 'public-read');
+
+          xhr.upload.addEventListener('progress', (e) => {
+            if (e.lengthComputable) {
+              const pct = Math.round((e.loaded / e.total) * 100);
+              progressBar.style.width = pct + '%';
+              statusText.textContent = pct < 100 ? `Uploading... ${pct}%` : 'Finalizing...';
+            }
+          });
+
+          xhr.addEventListener('load', () => {
+            if (xhr.status >= 200 && xhr.status < 300) resolve();
+            else reject(new Error(`Upload to storage failed (HTTP ${xhr.status})`));
+          });
+          xhr.addEventListener('error', () => reject(new Error('Network error during upload')));
+          xhr.addEventListener('abort', () => reject(new Error('Upload cancelled')));
+
+          xhr.send(selectedFile);
         });
 
-        xhr.open('POST', '/api/admin/videos/upload');
-        xhr.setRequestHeader('Authorization', `Bearer ${adminToken}`);
-        xhr.send(formData);
+        // ── Step 3: Ask server to validate + save to DB ──
+        progressBar.style.width = '100%';
+        statusText.textContent = 'Validating video...';
+
+        const finalizeRes = await fetch('/api/admin/videos/finalize-upload', {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${adminToken}`,
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            videoKey,
+            title,
+            category_id: categoryId,
+            price: parseInt(priceRupees) * 100,
+            tag: tag || null,
+            thumbnailDataUrl: generatedThumbnail
+              ? await new Promise((res) => {
+                  const reader = new FileReader();
+                  reader.onload = (e) => res(e.target.result);
+                  reader.readAsDataURL(generatedThumbnail);
+                })
+              : null,
+            filename: selectedFile.name,
+            contentType: selectedFile.type,
+            fileSize: selectedFile.size,
+          }),
+        });
+        const finalizeData = await finalizeRes.json();
+        if (finalizeData.ok) {
+          overlay.remove();
+          loadVideos();
+        } else {
+          alert(finalizeData.error || 'Upload failed during processing');
+          submitBtn.disabled = false;
+          submitBtn.textContent = 'Upload Video';
+          progressSection.style.display = 'none';
+        }
       } catch (err) {
         alert('Upload error: ' + err.message);
         submitBtn.disabled = false;
         submitBtn.textContent = 'Upload Video';
+        progressSection.style.display = 'none';
       }
     });
   }
+
 
   // ── Edit Video ──
   window._editVideo = async function(id) {

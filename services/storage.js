@@ -1,4 +1,5 @@
 const { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const crypto = require('crypto');
 const path = require('path');
@@ -150,9 +151,32 @@ function getPublicUrl(key) {
   }
 }
 
+/**
+ * Generate a presigned PUT URL that allows a browser to upload a file directly
+ * to Spaces without routing through the Node.js server.
+ *
+ * @param {string} key         - Storage key (e.g. 'videos/uuid-name.mp4')
+ * @param {string} contentType - MIME type the browser will send in Content-Type
+ * @param {number} expiresIn   - Seconds until the URL expires (default 1 hour)
+ */
+async function generatePresignedUploadUrl(key, contentType, expiresIn = 3600) {
+  if (!s3Client) throw new Error('Storage not configured');
+
+  const command = new PutObjectCommand({
+    Bucket: SPACES_BUCKET,
+    Key: key,
+    ContentType: contentType,
+    ACL: 'public-read',
+  });
+
+  const url = await getSignedUrl(s3Client, command, { expiresIn });
+  return url;
+}
+
 module.exports = {
   isStorageReady,
   generateUploadKey,
+  generatePresignedUploadUrl,
   uploadFile,
   uploadFileStream,
   downloadFile,
