@@ -38,7 +38,7 @@ const memoryPurchases = [];
 
 // ── Middleware ──
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
+app.use(express.json({ limit: '10mb' }));
 app.use(cookieParser());
 
 // ── Serve static files ──
