@@ -1,4 +1,4 @@
-const { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand, PutBucketCorsCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, DeleteObjectCommand, GetObjectCommand, PutBucketCorsCommand, PutObjectAclCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { Upload } = require('@aws-sdk/lib-storage');
 const crypto = require('crypto');
@@ -67,10 +67,26 @@ async function uploadFile(buffer, key, contentType) {
     Key: key,
     Body: buffer,
     ContentType: contentType,
+    ACL: 'public-read',
   });
 
   await s3Client.send(command);
   return getPublicUrl(key);
+}
+
+// Set an already-uploaded object to public-read. Used for files that arrive via
+// a presigned browser PUT (which intentionally omits ACL to avoid signature
+// mismatch), so the server flips them public after the upload is confirmed.
+async function setObjectPublic(key) {
+  if (!s3Client) throw new Error('Storage not configured');
+
+  const command = new PutObjectAclCommand({
+    Bucket: SPACES_BUCKET,
+    Key: key,
+    ACL: 'public-read',
+  });
+
+  await s3Client.send(command);
 }
 
 // Stream a file from disk to storage — memory usage stays flat (~10MB part buffer)
@@ -202,5 +218,6 @@ module.exports = {
   downloadPartial,
   downloadToTempFile,
   deleteFile,
+  setObjectPublic,
   getPublicUrl,
 };

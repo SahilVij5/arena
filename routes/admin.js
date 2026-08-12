@@ -6,7 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const { isStorageReady, generateUploadKey, generatePresignedUploadUrl, uploadFile, uploadFileStream, downloadFile, downloadPartial, downloadToTempFile, deleteFile, getPublicUrl } = require('../services/storage');
+const { isStorageReady, generateUploadKey, generatePresignedUploadUrl, uploadFile, uploadFileStream, downloadFile, downloadPartial, downloadToTempFile, deleteFile, setObjectPublic, getPublicUrl } = require('../services/storage');
 const { generateThumbnailFromPath, probeVideoFile } = require('../services/thumbnail');
 
 const router = express.Router();
@@ -371,23 +371,35 @@ router.post('/videos/finalize-upload', adminAuth, async (req, res) => {
     const durationSeconds = probe.durationSeconds;
     console.log(`Validation passed. Duration: ${durationSeconds}s`);
 
+    // The video was uploaded via a presigned PUT that omits ACL, so it lands
+    // private. Flip it to public-read so the player can stream it directly.
+    try {
+      await setObjectPublic(videoKey);
+      console.log(`Video object set public-read: ${videoKey}`);
+    } catch (aclErr) {
+      console.error(`Failed to set video public-read (${videoKey}):`, aclErr.message);
+    }
+
     // Generate / upload thumbnail
     let thumbnailUrl = null;
     let thumbnailKey = null;
 
     if (thumbnailDataUrl && thumbnailDataUrl.startsWith('data:image/')) {
       // Client sent a base64 thumbnail captured from the video element
+      console.log('Thumbnail: using client-generated image');
       const base64Data = thumbnailDataUrl.replace(/^data:image\/\w+;base64,/, '');
       const thumbBuffer = Buffer.from(base64Data, 'base64');
       thumbnailKey = generateUploadKey('thumbnails', originalName.replace(/\.[^.]+$/, '.jpg'));
       thumbnailUrl = await uploadFile(thumbBuffer, thumbnailKey, 'image/jpeg');
     } else {
       // Generate thumbnail with ffmpeg from the temp file
+      console.log('Thumbnail: no client image, generating with ffmpeg');
       const thumbBuffer = await generateThumbnailFromPath(tmpVideoPath);
       if (thumbBuffer) {
         thumbnailKey = generateUploadKey('thumbnails', originalName.replace(/\.[^.]+$/, '.jpg'));
         thumbnailUrl = await uploadFile(thumbBuffer, thumbnailKey, 'image/jpeg');
       } else {
+        console.log('Thumbnail: ffmpeg produced nothing, using SVG placeholder');
         // SVG placeholder fallback
         const placeholderSvg = `<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720">
           <rect width="1280" height="720" fill="#1f2326"/>
@@ -399,6 +411,8 @@ router.post('/videos/finalize-upload', adminAuth, async (req, res) => {
         thumbnailUrl = await uploadFile(placeholderBuffer, thumbnailKey, 'image/svg+xml');
       }
     }
+
+    console.log(`Thumbnail uploaded: ${thumbnailUrl}`);
 
     // Format duration
     let durationStr = '0:00';
